@@ -111,6 +111,19 @@ function selectTarget(ns, servers, hackLevel, numPorts) {
 
 function deployTo(ns, server, target) {
   ns.scp(["scripts/hack.js", "scripts/grow.js", "scripts/weaken.js"], server, "home");
+
+  // Check if workers already running on this server targeting this target
+  const procs = ns.ps(server);
+  const workerFiles = new Set(["scripts/hack.js", "scripts/grow.js", "scripts/weaken.js"]);
+  const workerProcs = procs.filter(p => workerFiles.has(p.filename));
+
+  if (workerProcs.length > 0) {
+    // If all workers are already on the right target, leave them alone
+    if (workerProcs.every(p => p.args[0] === target)) return;
+    // Target changed — kill stale workers and redeploy
+    for (const p of workerProcs) ns.kill(p.pid);
+  }
+
   const freeRam = ns.getServerMaxRam(server) - ns.getServerUsedRam(server);
   if (freeRam < 1.70) return;
 
@@ -120,29 +133,29 @@ function deployTo(ns, server, target) {
   const maxMoney = ns.getServerMaxMoney(target);
   const maxThreads = Math.floor(freeRam / 1.75);
 
-  // Small servers (< 8 GB): just hack, simple and effective
+  // Small servers (< 8 GB): just hack
   if (ns.getServerMaxRam(server) < 8) {
-    ns.exec("scripts/hack.js", server, Math.floor(freeRam / 1.70), target);
+    ns.exec("scripts/hack.js", server, Math.max(1, Math.floor(freeRam / 1.70)), target);
     return;
   }
 
   // Larger servers: balanced approach
-  // Only weaken if security is way too high
   if (security > minSec + 10) {
-    const t = Math.ceil(maxThreads * 0.5);
-    const h = maxThreads - t;
-    if (t > 0) ns.exec("scripts/weaken.js", server, t, target);
+    // Security too high — weaken hard, still hack a bit
+    const w = Math.ceil(maxThreads * 0.6);
+    const h = maxThreads - w;
+    if (w > 0) ns.exec("scripts/weaken.js", server, w, target);
     if (h > 0) ns.exec("scripts/hack.js", server, h, target);
-  } else if (money < maxMoney * 0.5) {
-    // Grow + hack together
-    const g = Math.ceil(maxThreads * 0.5);
+  } else if (money < maxMoney * 0.25) {
+    // Money very low — grow hard, still hack a bit
+    const g = Math.ceil(maxThreads * 0.7);
     const h = maxThreads - g;
     if (g > 0) ns.exec("scripts/grow.js", server, g, target);
     if (h > 0) ns.exec("scripts/hack.js", server, h, target);
   } else {
-    // Good state: mostly hack, some grow/weaken maintenance
-    const h = Math.max(1, Math.floor(maxThreads * 0.6));
-    const g = Math.max(1, Math.floor(maxThreads * 0.2));
+    // Good state: maximize hacking, light maintenance
+    const h = Math.max(1, Math.floor(maxThreads * 0.75));
+    const g = Math.max(1, Math.floor(maxThreads * 0.15));
     const w = Math.max(0, maxThreads - h - g);
     if (h > 0) ns.exec("scripts/hack.js", server, h, target);
     if (g > 0) ns.exec("scripts/grow.js", server, g, target);
