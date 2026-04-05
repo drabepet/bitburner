@@ -115,15 +115,11 @@ export async function main(ns) {
     servers = getServers();
     syncWorkers(servers);
 
-    // Re-evaluate target every 20 batches
-    if (batchNum % 20 === 0) {
-      const best = selectTarget(servers);
-      if (best !== target) {
-        if (target) ns.print(`INFO Target: ${target} → ${best}`);
-        target = best;
-        killAll(servers);
-        await prep(target, servers);
-      }
+    // Hardcoded target — dynamic selection re-enabled when skill/RAM grows
+    if (target !== "n00dles") {
+      target = "n00dles";
+      killAll(servers);
+      await prep(target, servers);
     }
 
     const wTime = ns.getWeakenTime(target);

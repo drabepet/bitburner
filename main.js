@@ -18,7 +18,7 @@ export async function main(ns) {
     openAndNuke(ns, allServers, numPorts);
 
     // 3. Pick best target
-    const target = selectTarget(ns, allServers, hackLevel);
+    const target = "n00dles";
     ns.print(`INFO Hack ${hackLevel} | RAM ${homeRam} GB | $${ns.formatNumber(money)} | Target: ${target}`);
 
     // 4. Launch modules FIRST (before workers eat RAM)
