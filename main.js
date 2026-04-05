@@ -92,14 +92,15 @@ function openAndNuke(ns, servers, numPorts) {
 }
 
 function selectTarget(ns, servers, hackLevel, numPorts) {
-  // Always start with n00dles — fast and reliable until we have real infrastructure
-  if (hackLevel < 200) return "n00dles";
-
   let best = "n00dles";
   let bestScore = 0;
   for (const host of servers) {
     if (!ns.hasRootAccess(host)) continue;
-    if (ns.getServerRequiredHackingLevel(host) > hackLevel) continue;
+    const reqLevel = ns.getServerRequiredHackingLevel(host);
+    if (reqLevel > hackLevel) continue;
+    // Only target servers where we have at least 2x the required level
+    // This ensures we can hack efficiently (good success chance)
+    if (reqLevel > hackLevel / 2) continue;
     const maxMoney = ns.getServerMaxMoney(host);
     if (maxMoney === 0) continue;
     const score = maxMoney / (ns.getHackTime(host) * Math.max(ns.getServerMinSecurityLevel(host), 1));
@@ -111,23 +112,38 @@ function selectTarget(ns, servers, hackLevel, numPorts) {
 function deployTo(ns, server, target) {
   ns.scp(["scripts/hack.js", "scripts/grow.js", "scripts/weaken.js"], server, "home");
   const freeRam = ns.getServerMaxRam(server) - ns.getServerUsedRam(server);
-  if (freeRam < 1.75) return;
+  if (freeRam < 1.70) return;
 
   const security = ns.getServerSecurityLevel(target);
   const minSec = ns.getServerMinSecurityLevel(target);
   const money = ns.getServerMoneyAvailable(target);
   const maxMoney = ns.getServerMaxMoney(target);
+  const maxThreads = Math.floor(freeRam / 1.75);
 
-  if (security > minSec + 5) {
-    const t = Math.floor(freeRam / 1.75);
+  // Small servers (< 8 GB): just hack, simple and effective
+  if (ns.getServerMaxRam(server) < 8) {
+    ns.exec("scripts/hack.js", server, Math.floor(freeRam / 1.70), target);
+    return;
+  }
+
+  // Larger servers: balanced approach
+  // Only weaken if security is way too high
+  if (security > minSec + 10) {
+    const t = Math.ceil(maxThreads * 0.5);
+    const h = maxThreads - t;
     if (t > 0) ns.exec("scripts/weaken.js", server, t, target);
-  } else if (money < maxMoney * 0.75) {
-    const t = Math.floor(freeRam / 1.75);
-    if (t > 0) ns.exec("scripts/grow.js", server, t, target);
+    if (h > 0) ns.exec("scripts/hack.js", server, h, target);
+  } else if (money < maxMoney * 0.5) {
+    // Grow + hack together
+    const g = Math.ceil(maxThreads * 0.5);
+    const h = maxThreads - g;
+    if (g > 0) ns.exec("scripts/grow.js", server, g, target);
+    if (h > 0) ns.exec("scripts/hack.js", server, h, target);
   } else {
-    const h = Math.floor((freeRam * 0.2) / 1.70);
-    const g = Math.floor((freeRam * 0.4) / 1.75);
-    const w = Math.floor((freeRam * 0.4) / 1.75);
+    // Good state: mostly hack, some grow/weaken maintenance
+    const h = Math.max(1, Math.floor(maxThreads * 0.6));
+    const g = Math.max(1, Math.floor(maxThreads * 0.2));
+    const w = Math.max(0, maxThreads - h - g);
     if (h > 0) ns.exec("scripts/hack.js", server, h, target);
     if (g > 0) ns.exec("scripts/grow.js", server, g, target);
     if (w > 0) ns.exec("scripts/weaken.js", server, w, target);
