@@ -1,19 +1,21 @@
 /** @param {NS} ns
- *  HWGW batch hacker with parallel batches.
- *  Launches as many simultaneous batches as RAM allows, staggered every
- *  SPACER*4 ms so each batch's operations land cleanly in order:
- *    Hack → Weaken1 → Grow → Weaken2  (50 ms apart)
- *  Distributes threads across all rooted servers including purchased ones.
+ *  Multi-target HWGW batch hacker.
+ *  - Selects top N targets by expected $/sec/thread
+ *  - Preps each target (min security + max money)
+ *  - Runs parallel HWGW batches across all rooted servers
+ *  - Primary target gets first pick of RAM; secondary targets use remainder
+ *  - Kills looping workers from main.js on startup to reclaim RAM
  */
 export async function main(ns) {
   ns.disableLog("ALL");
   ns.tail();
 
-  const SPACER       = 50;   // ms gap between each operation landing
-  const BATCH_PERIOD = SPACER * 4;  // 200 ms between batch starts
-  const HACK_FRAC    = 0.5;  // steal 50 % per batch (auto-scaled down if needed)
+  const SPACER       = 50;
+  const BATCH_PERIOD = SPACER * 4;   // 200 ms between batch starts
+  const MAX_TARGETS  = 3;
 
-  // BFS all usable servers
+  // ── Helpers ──────────────────────────────────────────────────────────────
+
   function getServers() {
     const list    = [];
     const visited = new Set(["home"]);
@@ -39,7 +41,6 @@ export async function main(ns) {
     }
   }
 
-  // Allocate threads across servers; returns unallocated remainder
   function alloc(servers, threads, script, ...args) {
     let rem = threads;
     for (const s of servers) {
@@ -52,8 +53,12 @@ export async function main(ns) {
     return rem;
   }
 
+  // Kill ALL worker scripts — both looping (hack.js etc.) and once-*
   function killAll(servers) {
-    const names = new Set(["scripts/once-hack.js", "scripts/once-grow.js", "scripts/once-weaken.js"]);
+    const names = new Set([
+      "scripts/hack.js", "scripts/grow.js", "scripts/weaken.js",
+      "scripts/once-hack.js", "scripts/once-grow.js", "scripts/once-weaken.js",
+    ]);
     for (const s of servers) {
       for (const p of ns.ps(s)) {
         if (names.has(p.filename)) ns.kill(p.pid);
@@ -61,15 +66,58 @@ export async function main(ns) {
     }
   }
 
+  // Kill only once-* workers targeting a specific host
+  function killTarget(servers, target) {
+    const names = new Set(["scripts/once-hack.js", "scripts/once-grow.js", "scripts/once-weaken.js"]);
+    for (const s of servers) {
+      for (const p of ns.ps(s)) {
+        if (names.has(p.filename) && p.args[0] === target) ns.kill(p.pid);
+      }
+    }
+  }
+
+  function hasRunningBatch(servers, target) {
+    const names = new Set(["scripts/once-hack.js", "scripts/once-grow.js", "scripts/once-weaken.js"]);
+    for (const s of servers) {
+      for (const p of ns.ps(s)) {
+        if (names.has(p.filename) && p.args[0] === target) return true;
+      }
+    }
+    return false;
+  }
+
+  function isPrepped(target) {
+    return ns.getServerSecurityLevel(target) <= ns.getServerMinSecurityLevel(target) + 0.5
+        && ns.getServerMoneyAvailable(target) >= ns.getServerMaxMoney(target) * 0.99;
+  }
+
+  // Top N targets by expected $/sec/thread
+  function selectTargets(servers, hackLevel) {
+    const candidates = [];
+    for (const host of servers) {
+      if (host === "home") continue;
+      if (!ns.hasRootAccess(host)) continue;
+      if (ns.getServerRequiredHackingLevel(host) > hackLevel / 2) continue;
+      const maxMoney = ns.getServerMaxMoney(host);
+      if (maxMoney === 0) continue;
+      const score = (maxMoney * ns.hackAnalyzeChance(host) * ns.hackAnalyze(host))
+                    / ns.getHackTime(host);
+      candidates.push({ host, score });
+    }
+    candidates.sort((a, b) => b.score - a.score);
+    return candidates.slice(0, MAX_TARGETS).map(c => c.host);
+  }
+
+  // Prep a single target: weaken to min sec, grow to max money
   async function prep(target, servers) {
     ns.print(`INFO Prepping ${target}...`);
+    killTarget(servers, target);
     for (let i = 0; i < 200; i++) {
+      if (isPrepped(target)) break;
       const sec      = ns.getServerSecurityLevel(target);
       const minSec   = ns.getServerMinSecurityLevel(target);
       const money    = ns.getServerMoneyAvailable(target);
       const maxMoney = ns.getServerMaxMoney(target);
-      if (sec <= minSec + 0.5 && money >= maxMoney * 0.99) break;
-      killAll(servers);
       if (sec > minSec + 0.5) {
         const wT = Math.max(1, Math.ceil((sec - minSec) / 0.05));
         alloc(servers, wT, "scripts/once-weaken.js", target, 0);
@@ -82,38 +130,22 @@ export async function main(ns) {
         alloc(servers, wT, "scripts/once-weaken.js", target, ns.getGrowTime(target) + 100);
         await ns.sleep(ns.getWeakenTime(target) + 500);
       }
+      killTarget(servers, target);
     }
     ns.print(`INFO ${target} prepped!`);
   }
 
-  const target = "n00dles";
-  let servers  = [];
-  let batchId  = 0;
-  let prepared = false;
-
-  while (true) {
-    servers = getServers();
-    syncWorkers(servers);
-
-    if (!prepared) {
-      killAll(servers);
-      await prep(target, servers);
-      prepared = true;
-    }
-
-    const wTime = ns.getWeakenTime(target);
-    const gTime = ns.getGrowTime(target);
-    const hTime = ns.getHackTime(target);
-
-    // Total free RAM across all servers
-    const totalRam = servers.reduce(
+  // Launch parallel HWGW batches for target using current free RAM; returns expected sleep time
+  let batchId = 0;
+  function launchBatches(target, servers, label = "") {
+    const wTime   = ns.getWeakenTime(target);
+    const gTime   = ns.getGrowTime(target);
+    const hTime   = ns.getHackTime(target);
+    const avail   = servers.reduce(
       (sum, s) => sum + Math.max(0, ns.getServerMaxRam(s) - ns.getServerUsedRam(s)), 0);
 
-    // Max parallel batches the time window can hold
-    const maxByTime = Math.max(1, Math.floor(wTime / BATCH_PERIOD));
-
-    // Find hack fraction where at least 1 batch fits
-    let hackFrac = HACK_FRAC;
+    // Scale hack fraction down until one batch fits
+    let hackFrac = 0.5;
     let hT, w1T, gT, w2T, batchRam;
     for (let i = 0; i < 25; i++) {
       hT       = Math.max(1, Math.floor(ns.hackAnalyzeThreads(target, hackFrac)));
@@ -121,47 +153,73 @@ export async function main(ns) {
       gT       = Math.max(1, Math.ceil(ns.growthAnalyze(target, 1 / (1 - hackFrac))));
       w2T      = Math.max(1, Math.ceil(gT * 0.004 / 0.05));
       batchRam = (hT + w1T + gT + w2T) * 1.75;
-      if (batchRam <= totalRam * 0.9) break;
+      if (batchRam <= avail * 0.95) break;
       hackFrac *= 0.7;
     }
 
-    if (batchRam > totalRam) {
-      ns.print(`WARN Not enough RAM (need ${batchRam.toFixed(0)} GB, have ${totalRam.toFixed(0)} GB)`);
-      await ns.sleep(5000);
-      continue;
-    }
+    if (batchRam > avail) return 0;
 
-    // How many parallel batches fit in available RAM?
-    const maxByRam    = Math.max(1, Math.floor(totalRam * 0.9 / batchRam));
-    const numBatches  = Math.min(maxByTime, maxByRam);
+    const maxByTime  = Math.max(1, Math.floor(wTime / BATCH_PERIOD));
+    const maxByRam   = Math.max(1, Math.floor(avail * 0.9 / batchRam));
+    const numBatches = Math.min(maxByTime, maxByRam);
 
-    // Re-prep if target drifted
-    const sec      = ns.getServerSecurityLevel(target);
-    const minSec   = ns.getServerMinSecurityLevel(target);
-    const money    = ns.getServerMoneyAvailable(target);
-    const maxMoney = ns.getServerMaxMoney(target);
-    if (sec > minSec + 5 || money < maxMoney * 0.1) {
-      ns.print(`WARN Out of sync — re-prepping (sec +${(sec - minSec).toFixed(1)}, ` +
-               `$${ns.formatNumber(money)}/${ns.formatNumber(maxMoney)})`);
-      prepared = false;
-      continue;
-    }
+    const delayH  = Math.max(0, wTime - hTime - SPACER);
+    const delayG  = Math.max(0, wTime - gTime + SPACER);
+    const delayW2 = SPACER * 2;
 
-    ns.print(`INFO ${numBatches}x batches [${(hackFrac * 100).toFixed(0)}%] ` +
-             `H:${hT} W1:${w1T} G:${gT} W2:${w2T} | ${(batchRam * numBatches).toFixed(0)} GB used`);
-
-    // Launch all batches staggered by BATCH_PERIOD
     for (let b = 0; b < numBatches; b++) {
       const off = b * BATCH_PERIOD;
       const tag = batchId++;
-      // Timing: W1 starts at off, H lands SPACER before W1, G lands SPACER after, W2 lands 2*SPACER after
-      alloc(servers, w1T, "scripts/once-weaken.js", target, off,                              tag);
-      alloc(servers, hT,  "scripts/once-hack.js",   target, off + wTime - hTime - SPACER,     tag);
-      alloc(servers, gT,  "scripts/once-grow.js",   target, off + wTime - gTime + SPACER,     tag);
-      alloc(servers, w2T, "scripts/once-weaken.js", target, off + SPACER * 2,                 tag);
+      alloc(servers, w1T, "scripts/once-weaken.js", target, off,                tag);
+      alloc(servers, hT,  "scripts/once-hack.js",   target, off + delayH,       tag);
+      alloc(servers, gT,  "scripts/once-grow.js",   target, off + delayG,       tag);
+      alloc(servers, w2T, "scripts/once-weaken.js", target, off + delayW2,      tag);
     }
 
-    // Wait for all batches to finish
-    await ns.sleep(wTime + numBatches * BATCH_PERIOD + 500);
+    ns.print(`INFO ${label}${target} [${(hackFrac*100).toFixed(0)}%] ` +
+             `${numBatches}x | H:${hT} W:${w1T} G:${gT} W:${w2T} | ` +
+             `${(batchRam*numBatches).toFixed(0)}GB`);
+
+    return wTime + numBatches * BATCH_PERIOD + 500;
+  }
+
+  // ── Main loop ─────────────────────────────────────────────────────────────
+
+  let servers = [];
+  let firstRun = true;
+
+  while (true) {
+    servers = getServers();
+    syncWorkers(servers);
+
+    const hackLevel = ns.getHackingLevel();
+    const targets   = selectTargets(servers, hackLevel);
+
+    if (!targets.length) { await ns.sleep(5000); continue; }
+
+    // On first run, kill all looping workers to reclaim RAM
+    if (firstRun) {
+      ns.print("INFO Clearing looping workers...");
+      killAll(servers);
+      firstRun = false;
+    }
+
+    // Prep any target that isn't ready
+    for (const t of targets) {
+      if (!isPrepped(t)) await prep(t, servers);
+    }
+
+    // Primary target: launch batches first, gets first pick of RAM
+    const primarySleep = launchBatches(targets[0], servers, "★ ");
+
+    // Secondary targets: use leftover RAM, skip if their previous batch still running
+    for (let i = 1; i < targets.length; i++) {
+      const t = targets[i];
+      if (!hasRunningBatch(servers, t)) {
+        launchBatches(t, servers, `[${i + 1}] `);
+      }
+    }
+
+    await ns.sleep(Math.max(primarySleep, 1000));
   }
 }
